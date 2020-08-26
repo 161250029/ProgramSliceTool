@@ -195,3 +195,274 @@
 
 + 源自Juliet数据集中的一个例子：Juliet数据集是带有注释标签的人工漏洞测试数据集，故可以从源代码层面看出IO.writeLine第43行存在潜在的漏洞。为了保证程序切片的精确度，我们需要如下几个参数：分析域文件、漏洞代码所在函数、漏洞代码所在函数签名、漏洞代码所在代码行、漏洞代码调用的函数、漏洞所在文件名。
 + 最终Wala给出的切片结果是：37，38，39，43.
+
+
+### Joana工具使用
+
+#### Joana分析步骤
+
+##### 第一步Joana配置
+
++ ```
+  SDGBuilder.SDGBuilderConfig scfg = new SDGBuilder.SDGBuilderConfig();
+          scfg.out = new PrintStream(new LoggingOutputStream(LOGGER, INFO));
+          scfg.nativeSpecClassLoader = new SliceJavaClassloader(new File[]{});
+          scfg.scope = makeMinimalScope(appJars, libJars, exclusions, scfg.nativeSpecClassLoader);
+          scfg.cache = new AnalysisCacheImpl();
+          scfg.cha = ClassHierarchyFactory.makeWithRoot(scfg.scope, new SliceClassLoaderFactory(scfg.scope.getExclusions()));
+          scfg.ext = ExternalCallCheck.EMPTY;
+          scfg.immutableNoOut = Main.IMMUTABLE_NO_OUT;
+          scfg.immutableStubs = Main.IMMUTABLE_STUBS;
+          scfg.ignoreStaticFields = Main.IGNORE_STATIC_FIELDS;
+          scfg.exceptions = SDGBuilder.ExceptionAnalysis.IGNORE_ALL;
+          scfg.pruneDDEdgesToDanglingExceptionNodes = true;
+          scfg.defaultExceptionMethodState = MethodState.DEFAULT;
+          scfg.accessPath = false;
+          scfg.sideEffects = null;
+          scfg.prunecg = 0;
+          scfg.pruningPolicy = ApplicationLoaderPolicy.INSTANCE;
+          scfg.pts = SDGBuilder.PointsToPrecision.INSTANCE_BASED;
+          scfg.customCGBFactory = null;
+          scfg.staticInitializers = SDGBuilder.StaticInitializationTreatment.SIMPLE;
+          scfg.fieldPropagation = SDGBuilder.FieldPropagation.OBJ_GRAPH;
+          scfg.computeInterference = false;
+          scfg.computeAllocationSites = false;
+          scfg.computeSummary = false;
+          scfg.cgConsumer = null;
+          scfg.additionalContextSelector = null;
+          scfg.dynDisp = SDGBuilder.DynamicDispatchHandling.IGNORE;
+          scfg.debugCallGraphDotOutput = false;
+          scfg.debugManyGraphsDotOutput = false;
+          scfg.debugAccessPath = false;
+          scfg.debugStaticInitializers = false;
+          scfg.entrypointFactory = new SliceEntrypointFactory();
+          scfg.cgPruner = new SliceCGPruner(50);
+          scfg.doParallel = false;
+          this.config = scfg;
+  ```
+
++ 配置定制可细化成类加载机制、分析域设置、函数入口设定和剪枝四部分。
+
+  + 类加载机制，继承ClassLoader，重写findClass方法：
+
+    + ```
+      protected Class<?> findClass(final String name)
+                  throws ClassNotFoundException {
+              String targetFile = name.replace(".", "/") + ".class";
+              byte[] classByte = null;
+              for (File file : classpaths) {
+                  ZipFile zipFile = null;
+                  try {
+                      zipFile = new ZipFile(file);
+                  } catch (IOException e) {
+                      continue;
+                  }
+      
+                  Enumeration<?> entries = zipFile.getEntries();
+                  while (entries.hasMoreElements()) {
+                      ZipEntry entry = (ZipEntry) entries.nextElement();
+                      if (entry.getName().endsWith(".class") && entry.getName().endsWith(targetFile)) {
+      //                    String entryName = entry.getName();
+                          try {
+                              byte[] b = new byte[(int) entry.getSize()];
+                              // 将压缩文件内容写入到这个文件中
+                              InputStream is = zipFile.getInputStream(entry);
+                              BufferedInputStream bis = new BufferedInputStream(is);
+                              bis.read(b);
+                              classByte = b;
+                              // 关流顺序，先打开的后关闭
+                              is.close();
+                          } catch (IOException e) {
+                              e.printStackTrace();
+                          }
+                          break;
+                      }
+                  }
+              }
+              if (classByte == null) {
+                  throw new ClassNotFoundException(name);
+              }
+              return defineClass(name, classByte, 0, classByte.length);
+          }
+      ```
+
+  + 分析域设置，最小化分析域（提高分析精度和速度）
+
+    + ```
+      String scopeFile = "src\\main\\java\\com\\example\\demo\\joanacore\\RtScopeFile.txt";
+              String exclusionFile = "src\\main\\java\\com\\example\\demo\\joanacore\\Java60RegressionExclusions.txt";
+              final AnalysisScope scope = AnalysisScopeReader.readJavaScope(
+                      scopeFile, (new FileProvider()).getFile(exclusionFile), classLoader);
+              for (File appJar : appJars) {
+                  scope.addToScope(ClassLoaderReference.Application, new JarStreamModule(new FileInputStream(appJar)));
+              }
+              if (libJars != null) {
+                  for (URL lib : libJars) {
+                      if (appJars.contains(new File(lib.getFile()))) {
+                          LOGGER.warn(lib + "in app scope.");
+                          continue;
+                      }
+                      if (lib.getProtocol().equals("file")) {
+                          scope.addToScope(ClassLoaderReference.Primordial, new JarStreamModule(new FileInputStream(lib.getFile())));
+                      } else {
+                          scope.addToScope(ClassLoaderReference.Primordial, new JarStreamModule(JoanaSlicer.class.getResourceAsStream(String.valueOf(lib))));
+                      }
+                  }
+              }
+      
+              if (exclusions != null) {
+                  for (String exc : exclusions) {
+                      scope.getExclusions().add(exc);
+                  }
+              }
+              return scope;
+      ```
+
+  + 函数入口设定，继承SubtypesEntryPoint，重写makeParameterTypes
+
+    + ```
+      protected TypeReference[] makeParameterTypes(IMethod method, int i) {
+              TypeReference nominal = method.getParameterType(i);
+              if (nominal.isPrimitiveType() || nominal.isArrayType())
+                  return new TypeReference[] { nominal };
+              else {
+                  IClass nc = getCha().lookupClass(nominal);
+                  if (nc == null) {
+                      return new TypeReference[] { nominal };
+                  }
+                  // 否则返回非抽象非子类的集合
+                  Collection<IClass> subcs = nc.isInterface() ? getCha().getImplementors(nominal) : getCha().computeSubClasses(nominal);
+                  Set<TypeReference> subs = HashSetFactory.make();
+                  for (IClass cs : subcs) {
+                      if (!cs.isAbstract() && !cs.isInterface()) {
+                          subs.add(cs.getReference());
+                      }
+                  }
+                  return subs.toArray(new TypeReference[subs.size()]);
+              }
+          }
+      ```
+
+  + 剪枝，实现CGPruner接口
+
+    + ```
+      public Set<CGNode> prune(final SDGBuilder.SDGBuilderConfig cfg, final CallGraph cg) {
+              Set<CGNode> keep = new HashSet<>();
+              Set<CGNode> marked = new HashSet<>();
+      
+              // BFS
+              Queue<CGNode> queue = new LinkedList<>();
+              CGNode head = cg.getFakeRootNode();
+              keep.add(head);
+              marked.add(head);
+              CGNode rootNode=head;
+      
+              marked.addAll(cg.getEntrypointNodes());
+              keep.addAll(cg.getEntrypointNodes());
+              queue.addAll(cg.getEntrypointNodes());
+      
+              int limit = nodeLimit + keep.size();
+              boolean rootNodeAdded=false;
+              while (!queue.isEmpty()) {
+                  if (keep.size() >= limit)
+                      break;
+                  head = queue.poll();
+                  keep.add(head);
+      
+                  for (Iterator<CGNode> it = cg.getSuccNodes(head); it.hasNext(); ) {
+                      CGNode childNode = it.next();
+                      if (!marked.contains(childNode)) {
+                          marked.add(childNode);
+                          if (cfg.pruningPolicy.check(childNode)) {
+                              queue.add(childNode);
+                          }
+                      }
+                  }
+                  if (!rootNodeAdded){
+                      rootNodeAdded=true;
+                      queue.add(rootNode);
+                  }
+              }
+      
+              return keep;
+          }
+      ```
+
+##### 第二步sdg程序切片
+
++ 构建sdg
+
+  + ```
+    String entryClass = "L" + func.getClazz().replace('.', '/');
+            String entryMethod = func.getMethod();
+            String entryRef = func.getSig();
+    SDG localSdg = null;
+            LOGGER.info("Building SDG... ");
+            // 根据class, method, ref在classloader中找入口函数
+            config.entry = findMethod(this.config, entryClass, entryMethod, entryRef);
+            // 构造SDG
+            try {
+                localSdg = SDGBuilder.build(this.config, new SliceMonitor());
+            } catch (NoSuchElementException e) {
+                StackTraceElement stackTraceElement = e.getStackTrace()[2];
+                if (stackTraceElement.getClassName().equals("edu.kit.joana.wala.core.CallGraph")
+                        && stackTraceElement.getMethodName().equals("<init>")) {
+                    throw new RootNodeNotFoundException(entryClass + "." + entryMethod + entryRef, "call-graph (or it was in primordial jar)");
+                }
+            }
+    ```
+
++ 查找seed语句的node(数量不止一个)
+
+  + ```
+    HashSet<SDGNode> nodes = new HashSet<>();
+            HashSet<SDGNode> successorNodes = new HashSet<>();
+            int dist = 987654321;
+            final BreadthFirstIterator<SDGNode, SDGEdge> it = new BreadthFirstIterator<SDGNode, SDGEdge>(sdg);
+            while (it.hasNext()) {
+                final SDGNode node = it.next();
+                // TODO node func name==sink func
+                if (node.getSource().equals(location.sourceFile)) {
+                    if (location.startLine <= node.getSr() && node.getSr() <= location.endLine) {//  && !isAbstractNode(node) && !isAbstractNode(node)) {
+                        nodes.add(node);
+                    }
+                    int currDist = node.getSr() - location.endLine; // 碰到string append可能会错位，但是应该只能错一位
+                    if (currDist >= 0 && currDist < dist) {
+                        successorNodes.clear();
+                        successorNodes.add(node);
+                        dist = currDist;
+                    } else if (currDist == dist) {
+                        successorNodes.add(node);
+                    }
+                }
+            }
+            if (nodes.isEmpty()) {
+                LOGGER.warn("No code at line: " + location + ", alter to successor nodes");
+                if (!successorNodes.isEmpty()) {
+                    nodes = successorNodes;
+                } else {
+                    throw new NotFoundException(location, func);
+                }
+            }
+            return nodes;
+    ```
+
+  + 在sdg上做后向切片
+
+    + ```
+      public Collection<SDGNode> slice(HashSet<SDGNode> points) {
+              Collection<SDGNode> result = slicer.slice(points);
+              List<SDGNode> toRemove = new ArrayList<>();
+              boolean verbose = false;
+              for (SDGNode n : result) {
+                  if (isRemoveNode(n)) {
+                      toRemove.add(n);
+                  } else if (verbose) {
+                      System.out.println(n.getId() + "\t" + n.getLabel() + "\t" + n.getType() + "\t" + n.getKind() + "\t"
+                              + n.getOperation() + "\t" + n.getSr() + "\t" + n.getSource() + "\t" + n.getBytecodeIndex());
+                  }
+              }
+              result.removeAll(toRemove);
+              return result;
+          }
+      ```
