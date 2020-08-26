@@ -199,6 +199,18 @@
 
 ### Joana工具使用
 
+#### Joana项目构建
+
++ ```
+  <dependency>
+  			<groupId>top.anemone.joana</groupId>
+  			<artifactId>joana-core</artifactId>
+  			<version>RELEASE-2020-04-22</version>
+  		</dependency>
+  ```
+
++ 除了要引入wala的相关依赖，还需要引入joana自己的jar包
+
 #### Joana分析步骤
 
 ##### 第一步Joana配置
